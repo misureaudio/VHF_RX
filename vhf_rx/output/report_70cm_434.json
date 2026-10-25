@@ -1,0 +1,18 @@
+{
+  "band": "70cm",
+  "rf_hz": 434000000.0,
+  "fs_hz": 6048000.0,
+  "lna": 20,
+  "gr_db": 50,
+  "agc": "50Hz",
+  "agc_setpoint_dbfs": -20,
+  "total_gain_db": 20.607498168945312,
+  "duration_s": 10.0,
+  "blocks": 44666,
+  "samples": 60031104,
+  "measured_rate_mspS": 6.003110400000001,
+  "dropped_blocks": 0,
+  "overload_events": 0,
+  "noise_floor_db": -28.094785690307617,
+  "channels": {}
+}
