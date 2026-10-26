@@ -38,12 +38,37 @@ try:
     # integrator alone low-passes the audio and loses ~30% of the tone.
     # The arctan2 PD is amplitude-invariant, so AGC steps don't modulate
     # the loop gain.
+    #
+    # Startup: `started` is 0 until the first sample with |x| >= gate.
+    # The decimation FIRs run from zero state, so the first ~10 16k
+    # samples of a stream are near-zero partial sums whose phase is
+    # numerically garbage. Starting the loop there injects a one-shot
+    # phase kick (up to ~pi in e) that can push the loop OUT of the
+    # capture basin of the true lock into a STABLE SLIP ORBIT:
+    # measured, a 300 Hz tone at 1.8 kHz deviation (beta = 6) then
+    # settles into the slip orbit instead of locking — the tone comes
+    # out at 72.6% of the tracking-response model with its harmonics
+    # at -6 dB, and the NCO frequency sits at ~-17.8 kHz. Initializing theta to the first
+    # valid sample's phase gives e0 = 0 (clean lock, identical to a
+    # pre-locked start), and the amplitude gate also holds the loop
+    # steady through deep fades in the live stream.
     @_numba.njit
-    def _pll_block(x, theta, integ, Kp, Ki, scale):
+    def _pll_block(x, theta, integ, Kp, Ki, scale, started):
         n = x.size
         out = np.empty(n)
         two_pi = 2.0 * np.pi
+        gate = 0.05
         for k in range(n):
+            if not started:
+                if np.abs(x[k]) < gate:
+                    out[k] = 0.0
+                    continue
+                theta = np.arctan2(x[k].imag, x[k].real)
+                if theta > np.pi:
+                    theta -= two_pi
+                elif theta < -np.pi:
+                    theta += two_pi
+                started = 1
             e = np.arctan2(x[k].imag, x[k].real) - theta
             if e > np.pi:
                 e -= two_pi
@@ -57,17 +82,24 @@ try:
             elif theta < -np.pi:
                 theta += two_pi
             out[k] = phi * scale
-        return out, theta, integ
+        return out, theta, integ, started
 
     _HAVE_NUMBA = True
 except ImportError:      # pragma: no cover - numba is in the project venv
     _HAVE_NUMBA = False
 
-    def _pll_block(x, theta, integ, Kp, Ki, scale):
+    def _pll_block(x, theta, integ, Kp, Ki, scale, started):
         out = np.empty(x.size)
         two_pi = 2.0 * np.pi
+        gate = 0.05
         re, im = x.real, x.imag
         for k in range(x.size):
+            if not started:
+                if (re[k] * re[k] + im[k] * im[k]) ** 0.5 < gate:
+                    out[k] = 0.0
+                    continue
+                theta = np.arctan2(im[k], re[k])
+                started = 1
             e = np.arctan2(im[k], re[k]) - theta
             if e > np.pi:
                 e -= two_pi
@@ -81,7 +113,7 @@ except ImportError:      # pragma: no cover - numba is in the project venv
             elif theta < -np.pi:
                 theta += two_pi
             out[k] = phi * scale
-        return out, theta, integ
+        return out, theta, integ, started
 
 
 def pll_tracking_response(f: float, f_n: float, zeta: float,
@@ -225,6 +257,7 @@ class ChannelDemod:
         self.pll_ki = w_n * w_n
         self.pll_theta = 0.0
         self.pll_integ = 0.0
+        self.pll_started = 0   # 0 until the first |x16| >= gate sample
         # NCO
         self.phase = 0.0
         self.step = 2.0 * np.pi * f0 / fs
@@ -355,9 +388,9 @@ class ChannelDemod:
         # interference monitor and the EN 300 086 "no clipping" check
         step_max = float(np.abs(np.angle(x * np.conj(xp))).max())
         if self.demod == "pll":
-            dev_hz, self.pll_theta, self.pll_integ = _pll_block(
+            dev_hz, self.pll_theta, self.pll_integ, self.pll_started = _pll_block(
                 x, self.pll_theta, self.pll_integ, self.pll_kp, self.pll_ki,
-                self.fs_ch / (2.0 * np.pi))
+                self.fs_ch / (2.0 * np.pi), self.pll_started)
         else:
             # quadrature discriminator (normalized)
             a = np.imag(x * np.conj(xp))

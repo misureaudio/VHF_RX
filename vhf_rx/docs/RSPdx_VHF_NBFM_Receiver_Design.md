@@ -246,7 +246,7 @@ FFT / 1.35 ms) is negligible.
 adjacent channel is only 12.5 kHz away and EN 300 086 requires tolerance of a
 co-channel interferer up to 12 dB above wanted. A 2nd-order PLL (loop BW 2–3 kHz)
 integrates out wideband adjacent noise, tracks DC/IQ offset, and is *linear* in
-the deviation — no sin(Δφ) folding: SND/ND 48.5 dB at ±3 kHz vs 40.4 dB for the
+the deviation — no sin(Δφ) folding: SND/ND 85.6 dB at ±3 kHz vs 40.4 dB for the
 quadrature discriminator (kept as selectable fallback, `ChannelDemod(demod="disc")`).
 Per-sample structure: wrapped phase error `e[n] = ∠x[n] − θ[n]` (arctan2 PD —
 amplitude-invariant, so AGC steps don't modulate the loop gain); loop filter
@@ -258,9 +258,11 @@ integrator alone low-passes the audio and loses ~30 % of the tone). Gains:
 `|T_f|` has a ~+1.7 dB bump near `f_n` (exact discrete form in
 `nbfm.pll_tracking_response`; the continuous-time `(Kp·s+Ki)/(s²+Kp·s+Ki)` is
 wrong near/above the loop BW). The PLL's PD wraps at π, so the same
-deviation-aliasing limit applies (|dev| < 8 kHz at 16 kHz); at the out-of-spec
-±5 kHz deviation the loop tracking error grows (SND/ND 7.7 dB) — the
-discriminator is better there (30.1 dB), which is why it stays available.
+deviation-aliasing limit applies (|dev| < 8 kHz at 16 kHz). At the out-of-spec
+±5 kHz deviation the startup frequency error exceeds the pull-in range and the
+loop runs in a slip state that preserves the deviation (audio = deviation + a DC
+offset removed by the DC blocker): measured fundamental −0.8 % vs linear,
+SND/ND 56.1 dB (discriminator: 30.1 dB).
 Settling (measured, `diag/validate_pll.py`): a hard 500 Hz carrier step
 settles within ±10 % in 0.19 ms on the loop alone; in the audio path the
 offset decays out in 19.2 ms, set by the DC blocker time constant
@@ -271,6 +273,25 @@ offset level in audio −0.00 Hz).
 The lock indicator (PD-error energy) is available as a free carrier-detect for
 the squelch; the implemented carrier detect is the power-ratio metric of the
 16 kHz baseband.
+
+**PLL startup (measured 2026-10-25):** the decimation FIRs run from zero state,
+so the first ~10 16 kHz samples of a stream are near-zero partial sums whose
+phase is numerically garbage. Starting the loop there injects a one-shot phase
+kick (up to ~π in the PD error); for a 300 Hz tone at 1.8 kHz deviation
+(β = 6, the hardest low-frequency voice case) the kick pushed the loop out of
+the capture basin into a *stable slip orbit* — the tone then came out at 72.6 %
+of the tracking-response model with its harmonics at −6 dB, and the loop stayed
+slipped for the entire stream (verified sample-by-sample: the slip orbit is
+attractive, not a transient). The loop therefore (a) amplitude-gates the PD
+(`|x| < 0.05`: hold the loop state, output 0 — also holds the loop steady
+through deep fades in the live stream) and (b) initializes the NCO to the first
+valid sample's phase (e₀ = 0, identical to a pre-locked start). After the fix:
+the 300 Hz β = 6 tone matches the tracking-response model to −0.1 % (1820 vs
+1821 Hz) with its harmonics at −119 dB; the PD error stays bounded (±0.18 rad)
+and the NCO frequency tracks the input frequency to ≤ 209 Hz. The startup kick
+was also corrupting the SND/ND measurements through the 8 ms DC blocker:
+±3 kHz 48.5 → 85.6 dB, ±5 kHz 7.7 → 56.1 dB after the fix. Regression test:
+`tests/test_nbfm.py::test_pll_low_freq_large_dev`.
 
 **De-emphasis:** standard 6 dB/oct FM pre-emphasis ↔ τ = 75 µs. At 8 kHz audio rate:
 `y[n] = α·(x[n] − x[n−1]) + (1−α)·y[n−1]`, `α = 1 − e^(−8000·75e−6) ≈ 0.811`.
@@ -301,6 +322,37 @@ the squelch; the implemented carrier detect is the power-ratio metric of the
 - Repeater output: 434.600 → 434.975 (32 ch)
 - (digital/ATV segments 433.625–433.775, 434.000, 434.450–434.575 pass through the
   band-limit filter but need no FM demod unless you add data decoders)
+
+### 4.5 Audio output (local sound device)
+
+The prototype plays demodulated audio on the computer's default output device
+(`--play`) via sounddevice/PortAudio (WASAPI shared mode on Windows); `--vol`
+scales the level, `--device` selects the output. Pipeline (`playback.py`,
+implemented 2026-10-25):
+
+- **Rate:** 8 kHz channel audio → **48 kHz mono float32** (WASAPI-native; 6×
+  integer ratio, `resample_poly` with symmetric edge padding — zero padding
+  would dip the tone ~10 % at every 11 ms block edge). A bounded 2 s ring
+  decouples the DSP thread from the PortAudio callback; the callback only
+  copies (silence on starvation). Starved frames *while a squelch-open channel
+  is active* are counted as underruns and reported at end of run; silence with
+  no open channel is by design and not counted.
+- **Gain:** fixed **1/5000 × vol**: 3 kHz deviation → 0.6 FS. No
+  auto-normalization (it pumps with speech level changes).
+- **Gating:** per-channel **5 ms linear ramp** on squelch open/close
+  (click-free); only squelch-open channels are mixed; the sum is clipped at
+  ±0.95.
+- **Wiring:** the worker taps each channel's audio block non-destructively
+  (the WAV save path is untouched) → `push(f, audio, squelch_open)` per
+  channel per chunk, `flush()` at chunk end, `drop(f)` when a channel leaves
+  the demod set. No output device → warn, continue recording only.
+
+Unit-tested without hardware (`tests/test_nbfm.py::test_audio_player`): the
+mix/resample/ring core is pure numpy and the PortAudio callback is called
+directly — gain (1.8 kHz dev → 0.36 FS, measured 0.360), 6× resample, squelch
+ramp, closed-channel silence, two-channel linear sum (0.72 FS), clip plateau
+(0.95; the resample FIR rings ~2 % at the hard clip edge), callback fill +
+underrun count.
 
 ---
 
@@ -369,7 +421,8 @@ single-band design with headroom.
 ## 8. Prototype status and verified performance (2026-10-25)
 
 Implemented: `nbfm.py` (DSP core), `prototype.py` (SDRPlay → DSP → report pipeline),
-`sdrplay_api.py` (ctypes binding, API v3.11), `tests/test_nbfm.py` (all passing).
+`playback.py` (audio output stage, §4.5), `sdrplay_api.py` (ctypes binding, API v3.11),
+`tests/test_nbfm.py` (all passing).
 Demodulator is the **2nd-order digital PLL** of §4.3 (implemented 2026-10-25; the
 quadrature discriminator is kept as a selectable fallback). All numbers below are
 measured on the RSPdx (SerNo 201004A243) with the workspace venv
@@ -481,17 +534,23 @@ rejection (54.3 dB at 12.5 kHz, equal level) · tone recovery (the PLL is linear
 in the deviation: fundamental `D·|T_f(1 kHz)|·|H_lp|·|H_dc|·|H_de|`, `T_f` the
 exact discrete loop tracking response — measured 1941 Hz vs 1954 expected) ·
 PLL carrier-offset tracking (+150 Hz offset on the carrier removed, audio DC
-0.00 Hz) · de-emphasis (−6 dB/oct, digital bilinear at 8 kHz) · CTCSS on/off
-(Goertzel, ±1 % edge cases) · activity-monitor channel detection.
+0.00 Hz) · PLL startup at low frequency / large deviation (300 Hz @ 1.8 kHz,
+β = 6: matches the tracking model to −0.1 %, no slip harmonics — regression
+for the startup-kick slip orbit, §4.3) · multitone linearity (400/1000/2000 Hz
+@ 800 Hz dev each, 2.4 kHz peak: each tone unchanged by the other two, IM
+products ≤ −40 dB below the tones — worst −82.6 dB) · de-emphasis (−6 dB/oct,
+digital bilinear at 8 kHz) · CTCSS on/off (Goertzel, ±1 % edge cases) ·
+activity-monitor channel detection · audio output stage (playback.py: gain
+1/5000, 6× resample, squelch ramp, mix/clip, ring + callback — §4.5).
 
 EN 300 086 conformance (12.5 kHz spacing, cl. 6.1 normal modulation =
 1 kHz @ 60 % MPFD, O.41 psophometric SND/ND):
 
 | Test | Result |
 |---|---|
-| Co-channel rejection, cl. 8.3.3 (crossing must lie in −12…0 dB; unwanted raised until SND/ND = 14 dB) | PASS — crossings −8.3 dB (0 Hz), −9.1/−9.2 dB (±1.5 kHz), −8.0/−8.2 dB (±3 kHz); worst −9.2 dB (discriminator: −8.3 dB) |
+| Co-channel rejection, cl. 8.3.3 (crossing must lie in −12…0 dB; unwanted raised until SND/ND = 14 dB) | PASS — crossings −8.3 dB (0 Hz), −9.1 dB (±1.5 kHz), −8.0/−8.2 dB (±3 kHz); worst −9.1 dB (discriminator: −8.3 dB) |
 | Adjacent-channel selectivity, cl. 8.4 (≥ 60 dB) | PASS — ≥ +80 dB (scan ceiling), both ±12.5 kHz |
-| Deviation headroom ±3 kHz / ±5 kHz: no deviation aliasing (16 kHz phase step < π), fundamental within 5 % of `D·|T_f(1 kHz)|`·stages, SND/ND ≥ 20 dB @ ±3 kHz | PASS — 67°/109° max step; 3235 Hz vs 3257 expected @ ±3 kHz (−0.7 %); SND/ND 48.5 dB @ ±3 kHz. ±5 kHz (the 25 kHz MPFD — out of spec for our 12.5 kHz grid): loop tracking degrades — fundamental 3607 Hz vs linear 5428, SND/ND 7.7 dB (info, not gated; the discriminator fallback is better there: 30.1 dB) |
+| Deviation headroom ±3 kHz / ±5 kHz: no deviation aliasing (16 kHz phase step < π), fundamental within 5 % of `D·|T_f(1 kHz)|`·stages, SND/ND ≥ 20 dB @ ±3 kHz | PASS — 67°/109° max step; 3235 Hz vs 3257 expected @ ±3 kHz (−0.7 %); SND/ND 85.6 dB @ ±3 kHz. ±5 kHz (the 25 kHz MPFD — out of spec for our 12.5 kHz grid): the loop runs in a slip state that preserves the deviation (§4.3) — fundamental 5387 Hz vs linear 5428 (−0.8 %), SND/ND 56.1 dB (info, not gated; the discriminator fallback: 30.1 dB) |
 
 Measurement gotchas fixed along the way (kept for the record): the psoph FIR
 must be trimmed of its zero-state fill-up transient (a 32 ms burst smears a

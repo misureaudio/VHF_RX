@@ -191,6 +191,137 @@ def test_pll_offset_tracking():
           abs(dc) < 5.0, f"(DC {dc:+.2f} Hz)")
 
 
+def test_pll_low_freq_large_dev():
+    """PLL startup regression (2026-10-25): 300 Hz tone at 1.8 kHz
+    deviation (beta = 6, the hardest low-frequency voice case). The
+    decimation FIRs start from zero state, so the first ~10 16k samples
+    of a stream are near-zero partial sums whose phase is numerically
+    garbage. Starting the loop there injects a one-shot phase kick (up to
+    ~pi in the PD error); for this tone the kick pushed the loop out of
+    the capture basin into a stable slip orbit — the tone then came out
+    at 72.6 % of the tracking-response model with its harmonics at
+    -6 dB, forever. The loop now amplitude-gates the PD (|x| < 0.05) and
+    initializes the NCO to the first valid sample's phase (e0 = 0). The
+    tone must match the model and no slip harmonics may appear."""
+    n = int(2 * FS)
+    t = np.arange(n) / FS
+    d = ChannelDemod(145.0e6, FS)
+    out = feed(d, fm_modulate(1800.0 * np.sin(2 * np.pi * 300 * t),
+                              145.0e6, FS))[:16000]  # exactly 2.000 s
+    N = out.size
+    X = np.abs(np.fft.rfft(out * np.hanning(N)))
+
+    def amp(f):
+        return float(4.0 * X[int(round(f * N / 8000))] / N)
+
+    w = 2j * np.pi * 300 / 16000
+    h_lp = abs((d.lp_b[0] + d.lp_b[1]*np.exp(-w) + d.lp_b[2]*np.exp(-2*w)) /
+               (d.lp_a[0] + d.lp_a[1]*np.exp(-w) + d.lp_a[2]*np.exp(-2*w)))
+    h_dc = abs(d.dc_a * (1 - np.exp(-w)) / (1 - d.dc_a * np.exp(-w)))
+    c = 2 * 75e-6 * 8000
+    de_b = np.array([1.0, 1.0]) / (1.0 + c)
+    de_a = np.array([1.0, (1.0 - c) / (1.0 + c)])
+    w8 = 2j * np.pi * 300 / 8000
+    h_de = abs((de_b[0] + de_b[1]*np.exp(-w8)) / (de_a[0] + de_a[1]*np.exp(-w8)))
+    expected = 1800.0 * pll_tracking_response(300.0, PLL_F_N, PLL_ZETA) \
+        * h_de * h_lp * h_dc
+    check("PLL: 300 Hz @ 1.8 kHz dev (beta=6) matches tracking model",
+          abs(amp(300.0) - expected) / expected < 0.02,
+          f"(got {amp(300.0):.0f} Hz, expect {expected:.0f})")
+    # slip-lock signature: the tone's harmonics at -6 dB (measured pre-fix)
+    worst_h = max(20 * np.log10(amp(f) / amp(300.0))
+                  for f in (600.0, 900.0, 1200.0, 1500.0, 1800.0))
+    check("PLL: no slip harmonics (300 Hz beta=6, <= -30 dB)",
+          worst_h <= -30.0, f"(worst harmonic {worst_h:+.1f} dB rel)")
+
+
+def test_multitone_linearity():
+    """Multitone (400/1000/2000 Hz @ 800 Hz deviation each, 2.4 kHz peak):
+    the PLL demod is linear in the deviation, so the output must be the sum
+    of the three single-tone responses — no intermodulation products in
+    band. A single-tone test cannot see inter-tone interaction (loop
+    nonlinearity, saturation, gain modulation): it shows up as new tones at
+    the 2nd-order products of the three that fall in-band and don't
+    coincide with a tone: 600 (1000-400), 800 (2*400), 1400 (400+1000),
+    1600 (2000-400), 2400 (400+2000), 3000 (1000+2000)."""
+    n = int(2 * FS)
+    t = np.arange(n) / FS
+    A = 800.0
+    f_tones = (400.0, 1000.0, 2000.0)
+    audio = A * (np.sin(2 * np.pi * 400 * t)
+                 + np.sin(2 * np.pi * 1000 * t)
+                 + np.sin(2 * np.pi * 2000 * t))
+    d = ChannelDemod(145.0e6, FS)
+    out = feed(d, fm_modulate(audio, 145.0e6, FS))[:16000]  # exactly 2.000 s
+    N = out.size
+    X = np.abs(np.fft.rfft(out * np.hanning(N)))
+
+    def amp(f):
+        return float(4.0 * X[int(round(f * N / 8000))] / N)
+
+    def h_lp(f):
+        w = 2j * np.pi * f / 16000
+        return abs((d.lp_b[0] + d.lp_b[1]*np.exp(-w) + d.lp_b[2]*np.exp(-2*w)) /
+                   (d.lp_a[0] + d.lp_a[1]*np.exp(-w) + d.lp_a[2]*np.exp(-2*w)))
+
+    def h_dc(f):
+        w = 2j * np.pi * f / 16000
+        return abs(d.dc_a * (1 - np.exp(-w)) / (1 - d.dc_a * np.exp(-w)))
+
+    c = 2 * 75e-6 * 8000
+    de_b = np.array([1.0, 1.0]) / (1.0 + c)
+    de_a = np.array([1.0, (1.0 - c) / (1.0 + c)])
+
+    def h_de(f):
+        w8 = 2j * np.pi * f / 8000
+        return abs((de_b[0] + de_b[1]*np.exp(-w8)) / (de_a[0] + de_a[1]*np.exp(-w8)))
+
+    # 1) superposition: each tone in the mix must match that tone ALONE —
+    #    the solo baseline isolates inter-tone interaction from the small
+    #    full-chain model deviation near the loop crossover (the model is
+    #    exact for the loop alone; the 6M NCO zero-order hold adds a small
+    #    feedback delay, documented in diag/README.md: -0.6 % @ 1 kHz,
+    #    -2.5 % @ 2 kHz, -5.8 % @ 3 kHz)
+    for f in f_tones:
+        solo = A * np.sin(2 * np.pi * f * t)
+        d_s = ChannelDemod(145.0e6, FS)
+        out_s = feed(d_s, fm_modulate(solo, 145.0e6, FS))[:16000]
+        Xs = np.abs(np.fft.rfft(out_s * np.hanning(N)))
+        amp_solo = float(4.0 * Xs[int(round(f * N / 8000))] / N)
+        check(f"multitone: {f:.0f} Hz tone unchanged by the other two tones",
+              abs(amp(f) - amp_solo) / amp_solo < 0.02,
+              f"(mix {amp(f):.0f} vs solo {amp_solo:.0f})")
+    # 2) intermodulation floor: the in-band 2nd-order products must sit at
+    #    the numerical floor (the PLL is linear in deviation; the arctan2
+    #    PD is amplitude-invariant, so no gain modulation either)
+    tone_amp = float(np.mean([amp(f) for f in f_tones]))
+    im_bins = (600.0, 800.0, 1400.0, 1600.0, 2400.0, 3000.0)
+    worst_f, worst_db = 0.0, -1e9
+    for f in im_bins:
+        rel = 20 * np.log10(amp(f) / tone_amp)
+        if rel > worst_db:
+            worst_f, worst_db = f, rel
+    check("multitone: IM products <= -40 dB below tones (PLL linear)",
+          worst_db <= -40.0, f"(worst {worst_f:.0f} Hz at {worst_db:+.1f} dB rel)")
+    # 3) the theoretical model (exact T_f x stages) for reference
+    for f in f_tones:
+        expected = (A * pll_tracking_response(f, PLL_F_N, PLL_ZETA)
+                    * h_de(f) * h_lp(f) * h_dc(f))
+        print(f"  [info] {f:.0f} Hz: mix {amp(f):.0f} vs model {expected:.0f} "
+              f"({amp(f) / expected - 1:+.1%})")
+    # 4) the discriminator fallback has real sin(delta-phi) folding at
+    #    2.4 kHz peak deviation (max 16k phase step 0.94 rad) — report,
+    #    don't gate (design doc §4.3: why the PLL is the default)
+    d2 = ChannelDemod(145.0e6, FS, demod="disc")
+    out2 = feed(d2, fm_modulate(audio, 145.0e6, FS))[:16000]
+    X2 = np.abs(np.fft.rfft(out2 * np.hanning(N)))
+    amp2 = lambda f: float(4.0 * X2[int(round(f * N / 8000))] / N)
+    tone_amp2 = float(np.mean([amp2(f) for f in f_tones]))
+    worst2 = max(20 * np.log10(amp2(f) / tone_amp2) for f in im_bins)
+    print(f"  [info] discriminator IM floor at the same deviation: "
+          f"{worst2:+.1f} dB rel (sin folding)")
+
+
 def test_adjacent_channel():
     n = int(2 * FS)
     t = np.arange(n) / FS
@@ -397,18 +528,116 @@ def test_deviation_headroom():
         else:
             # ±5 kHz is the 25 kHz MPFD — OUT of spec for our 12.5 kHz
             # receiver (IARU FM.1 = ±3 kHz, EN 300 086 Table 3 = ±2.5 kHz).
-            # The 2.4 kHz PLL loop tracks in-spec deviation linearly, but at
-            # ±5 kHz its tracking error grows (PD error ~1.6 rad) and the
-            # SND/ND degrades; report, don't gate.
+            # At ±5 kHz the startup frequency error exceeds the loop
+            # pull-in range, so the loop runs in a slip state that
+            # preserves the deviation (audio = deviation + a DC offset
+            # removed by the DC blocker); report, don't gate.
             print(f"  [info] ±5 kHz (out-of-spec headroom): fundamental "
                   f"{lines[f1]:.0f} Hz (linear expect {expected:.0f}), "
                   f"SND/ND {r:.1f} dB")
+
+
+def test_audio_player():
+    """Audio output stage (playback.py): squelch gating + 5 ms ramp,
+    fixed gain, multi-channel mix + clip, 8k->48k resample, ring and
+    callback. Pure numpy — the PortAudio callback is called directly,
+    no sound device required."""
+    from playback import AudioPlayer, FS_IN, FS_OUT, GAIN_DEFAULT
+    fs = FS_IN
+    n = 4000                                  # 500 ms
+    t = np.arange(n) / fs
+    dev = 1800.0 * np.sin(2 * np.pi * 1000.0 * t)   # 1 kHz @ 1.8 kHz dev
+
+    def drain(p):
+        with p.lock:
+            out = np.concatenate(list(p.ring)) if p.ring else np.zeros(0)
+            p.ring.clear()
+            p.ring_n = 0
+        return out
+
+    # single open channel: gain, resample ratio, tone freq, ramp start
+    p = AudioPlayer()
+    for i in range(0, n, 200):
+        p.push(145.5e6, dev[i:i + 200], True)
+        p.flush()
+    out = drain(p)
+    check("player: 8k->48k resample ratio 6", out.size == n * 6, f"(got {out.size})")
+    lines = tone_freqs(out, FS_OUT)
+    f1 = max(lines, key=lines.get)
+    check("player: tone at 1 kHz after resample", abs(f1 - 1000) < 8,
+          f"(got {f1:.1f} Hz)")
+    expected = 1800.0 * GAIN_DEFAULT          # 0.36 FS
+    check("player: fixed gain 1/5000 (1.8 kHz dev -> 0.36 FS)",
+          abs(lines[f1] - expected) / expected < 0.03,
+          f"(got {lines[f1]:.3f}, expect {expected:.3f})")
+    check("player: squelch ramp starts at 0", abs(out[0]) < 0.05 * expected,
+          f"(first sample {out[0]:.4f})")
+
+    # squelch-closed channel contributes nothing
+    p2 = AudioPlayer()
+    for i in range(0, n, 200):
+        p2.push(145.5e6, dev[i:i + 200], False)
+        p2.flush()
+    check("player: squelch-closed channel contributes nothing",
+          drain(p2).size == 0)
+
+    # two identical open channels: linear sum, no clip (2 x 0.36 = 0.72)
+    p3 = AudioPlayer()
+    for i in range(0, n, 200):
+        p3.push(145.5e6, dev[i:i + 200], True)
+        p3.push(145.6e6, dev[i:i + 200], True)
+        p3.flush()
+    out3 = drain(p3)
+    lines3 = tone_freqs(out3, FS_OUT)
+    f3 = max(lines3, key=lines3.get)
+    check("player: two-channel mix sums linearly (0.72 FS)",
+          abs(lines3[f3] - 2.0 * expected) / (2.0 * expected) < 0.03,
+          f"(got {lines3[f3]:.3f}, expect {2.0 * expected:.3f})")
+
+    # overdrive: 2 x 3 kHz dev = 1.2 -> clipped at +/-0.95
+    dev_big = 3000.0 * np.sin(2 * np.pi * 1000.0 * t)
+    p4 = AudioPlayer()
+    for i in range(0, n, 200):
+        p4.push(145.5e6, dev_big[i:i + 200], True)
+        p4.push(145.6e6, dev_big[i:i + 200], True)
+        p4.flush()
+    out4 = drain(p4)
+    # the plateau sits at 0.95; the resample FIR rings ~2% at the hard
+    # clip edge (negative sidelobes), so check plateau + no >FS peak,
+    # not the exact peak
+    peak4 = float(np.max(np.abs(out4)))
+    p99 = float(np.percentile(np.abs(out4), 99))
+    check("player: overdriven mix clipped at +/-0.95 (no >FS peak)",
+          p99 > 0.93 and peak4 < 1.0,
+          f"(99th pct {p99:.3f}, peak {peak4:.3f})")
+
+    # callback: fills outdata from the ring; silence + underrun count when starved
+    p5 = AudioPlayer()
+    for i in range(0, n, 200):
+        p5.push(145.5e6, dev[i:i + 200], True)
+        p5.flush()
+    frames = 480
+    outdata = np.zeros((frames, 1), dtype=np.float32)
+    p5._cb(outdata, frames, None, None)
+    check("player: callback fills outdata from ring",
+          float(np.abs(outdata).max()) > 0.1,
+          f"(peak {float(np.abs(outdata).max()):.3f})")
+    with p5.lock:
+        p5.ring.clear()
+        p5.ring_n = 0
+    before = p5.underrun_frames
+    p5._cb(outdata, frames, None, None)
+    check("player: starved callback -> silence + underrun count",
+          np.all(outdata == 0) and p5.underrun_frames == before + frames,
+          f"(underruns {before} -> {p5.underrun_frames})")
 
 
 if __name__ == "__main__":
     test_structs()
     test_tone_recovery()
     test_pll_offset_tracking()
+    test_pll_low_freq_large_dev()
+    test_multitone_linearity()
     test_de_emphasis()
     test_adjacent_channel()
     test_squelch_and_ctcss()
@@ -416,6 +645,7 @@ if __name__ == "__main__":
     test_co_channel()
     test_adjacent_channel_selectivity()
     test_deviation_headroom()
+    test_audio_player()
     print()
     if FAILS:
         print(f"FAILED: {len(FAILS)} test(s): {FAILS}")

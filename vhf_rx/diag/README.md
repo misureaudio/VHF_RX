@@ -68,17 +68,19 @@ is negligible.
 ## PLL demod validation (offline)
 
 ### validate_pll.py
-Full-chain PLL validation (design doc §4.3). Five checks (2026-10-25 run):
+Full-chain PLL validation (design doc §4.3). Five checks (2026-10-25 run,
+after the PLL startup fix — see design doc §4.3 "PLL startup"):
 1. **Tracking response** — 300/1000/3000 Hz tones vs
-   `nbfm.pll_tracking_response` × stage gains: 1000 Hz within 0.6 % (the
-   gated conformance point, §8.4); 3000 Hz −5.8 %; 300 Hz −27.4 %
-   (full-chain effect beyond the ideal-loop model — the loop alone
-   matches theory exactly, see `isolate_pll.py`).
-2. **Linearity** — SND/ND at ±3/±5 kHz deviation: PLL 51.6 dB vs
-   discriminator 40.4 dB at ±3 kHz (conformance gate value: 48.5 dB,
-   §8.4); at the out-of-spec ±5 kHz the loop tracking degrades (7.7 dB)
-   — the discriminator is better there (30.1 dB), which is why it stays
-   as the selectable fallback.
+   `nbfm.pll_tracking_response` × stage gains: 300 Hz −0.1 % (the startup-kick
+   slip orbit used to cost −27.4 % here), 1000 Hz −0.6 % (the gated
+   conformance point, §8.4), 3000 Hz −5.8 % (full-chain effect near the loop
+   crossover — the loop alone matches theory exactly, see `isolate_pll.py`).
+2. **Linearity** — SND/ND at ±3/±5 kHz deviation: PLL 85.8 dB vs
+   discriminator 40.4 dB at ±3 kHz (the pre-fix 51.6 dB was the startup
+   transient leaking through the 8 ms DC blocker); at the out-of-spec ±5 kHz
+   the loop runs in a slip state that preserves the deviation (56.1 dB) — the
+   discriminator is 30.1 dB there, which is why it stays as the selectable
+   fallback for comparison.
 3. **Carrier offset tracking** — a +150 Hz offset leaves the tone
    unchanged (−0.00 %) and is rejected from the audio (−0.00 Hz): the
    PLL locks the offset into the NCO and the DC blocker removes the
@@ -106,5 +108,8 @@ form matches to 0.1 %.
 Feeds a pure tone directly into `nbfm._pll_block` at 16 kHz (no DDC, no
 stages) and measures output amplitude vs input deviation. Localizes demod
 accuracy to the PLL itself: the PLL alone matches theory exactly
-(1.028/1.220/1.533 at 300/1000/3000 Hz for a 1.8 kHz dev tone), so any
-full-chain discrepancy is in the DDC/decimation/stages, not the loop.
+(1.028/1.220/1.533 at 300/1000/3000 Hz for a 1.8 kHz dev tone). After the
+startup fix (design doc §4.3 "PLL startup") the full chain matches the model
+at 300/1000 Hz too (−0.1 % / −0.6 %); the remaining −5.8 % at 3000 Hz is the
+full-chain effect near the loop crossover (the 6M NCO zero-order hold adds a
+small feedback delay).

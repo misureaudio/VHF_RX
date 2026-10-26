@@ -63,6 +63,7 @@ class RxWorker:
         self.audio_buf: dict[float, list] = {}
         self.metrics: dict[float, dict] = {}
         self.active_now: list[float] = []
+        self.player = None          # playback.AudioPlayer, set by main() with --play
         self._lock = threading.Lock()
         self._stop = threading.Event()
 
@@ -140,6 +141,8 @@ class RxWorker:
                 del self.squelches[f]
                 del self.audio_buf[f]
                 del self.metrics[f]
+                if self.player is not None:
+                    self.player.drop(f)
         for f in active:
             ctcss = self.args.ctcss if f in (self.args.channels or []) else None
             self._ensure_demod(f, ctcss)
@@ -156,6 +159,12 @@ class RxWorker:
                 buf.append(audio)
                 if sum(a.size for a in buf) > self.args.duration * 8000 * 2:
                     del buf[:len(buf) // 2]
+            # play tap: non-destructive copy (audio_buf above feeds the WAV
+            # save; the old --play code popped from it and raced save())
+            if self.player is not None and audio.size:
+                self.player.push(f, audio, sq)
+        if self.player is not None:
+            self.player.flush()
 
     def run(self):
         self.t_start = time.monotonic()
@@ -283,7 +292,12 @@ def main():
     ap.add_argument("--ctcss", type=float, default=None,
                     help="CTCSS tone (Hz) for fixed channels; must be in the TS 103 236 table")
     ap.add_argument("--duration", type=float, default=10.0)
-    ap.add_argument("--play", action="store_true", help="play audio via sounddevice")
+    ap.add_argument("--play", action="store_true",
+                    help="play audio on the local output device (48 kHz mono, sounddevice)")
+    ap.add_argument("--vol", type=float, default=1.0,
+                    help="playback volume multiplier on the fixed 1/5000 gain (3 kHz dev = 0.6 FS at 1.0)")
+    ap.add_argument("--device", default=None,
+                    help="output device index or name substring (default: system default)")
     ap.add_argument("--out", default="output")
     args = ap.parse_args()
 
@@ -321,32 +335,20 @@ def main():
 
     player = None
     if args.play:
-        import sounddevice as sd
-        ring = {"buf": np.zeros(0, dtype=np.float32), "lock": threading.Lock()}
-        def _cb(outdata, frames, t, status):
-            with ring["lock"]:
-                b = ring["buf"]
-                take = min(frames, b.size)
-                outdata[:take, 0] = (b[:take] * 32767.0)
-                outdata[take:, 0] = 0
-                ring["buf"] = b[take:]
-        player = sd.OutputStream(8000, 1, "float32", callback=_cb)
-        player.start()
-        # pump mixed audio into the ring
-        def _pump():
-            while not worker._stop.is_set():
-                with ring["lock"]:
-                    mix = None
-                    for f, buf in worker.audio_buf.items():
-                        if worker.metrics[f]["squelch_open"] and buf:
-                            a = buf.pop(0)
-                            mix = a if mix is None else np.minimum(mix + a, 1.0)
-                    if mix is not None:
-                        ring["buf"] = np.concatenate([ring["buf"], mix]) if ring["buf"].size else mix
-                    if ring["buf"].size > 8000:
-                        ring["buf"] = ring["buf"][-8000:]
-                time.sleep(0.01)
-        threading.Thread(target=_pump, daemon=True).start()
+        from playback import AudioPlayer
+        player = AudioPlayer(vol=args.vol)
+        dev = (int(args.device) if args.device is not None
+               and str(args.device).isdigit() else args.device)
+        try:
+            player.start(device=dev)
+            import sounddevice as sd
+            q = sd.query_devices(player.stream.device, "output")
+            print(f"[rx] audio: 48 kHz mono -> {q['name']}")
+        except Exception as e:
+            print(f"[rx] WARNING: audio output unavailable "
+                  f"({type(e).__name__}: {e}); recording only")
+            player = None
+    worker.player = player
 
     try:
         th.join(timeout=args.duration + 5)
@@ -356,7 +358,6 @@ def main():
     time.sleep(0.3)
     if player:
         player.stop()
-        player.close()
     saved = worker.save(args.out)
     rx.stop()
 
@@ -371,6 +372,11 @@ def main():
         print(f"  {f} MHz: P={c['power_db']:.1f} dBFS  SNR={snr}  "
               f"squelch={'OPEN' if c['squelch_open'] else 'closed'} "
               f"(open {c['open_fraction']*100:.0f}%)  ctcss={c['ctcss_tone']}")
+    if player is not None:
+        und_ms = player.underrun_frames / player.fs_out * 1000.0
+        print(f"audio: {und_ms:.0f} ms underrun (starved while a channel "
+              f"was open) over {rep['duration_s']:.0f} s "
+              f"({'ok' if und_ms < 50 else 'check CPU load / SDR gaps'})")
     print("saved:", *saved, sep="\n  ")
 
 

@@ -98,7 +98,7 @@ n16 = 2 * 16000
 freq16 = np.zeros(n16)
 freq16[n16 // 2:] = 500.0
 x16 = np.exp(2j * np.pi * np.cumsum(freq16) / 16000).astype(np.complex64)
-out, _, _ = _pll_block(x16, 0.0, 0.0, Kp, Ki, 16000.0 / (2 * np.pi))
+out, _, _, _ = _pll_block(x16, 0.0, 0.0, Kp, Ki, 16000.0 / (2 * np.pi), 0)
 post = out[n16 // 2:]
 final = float(np.mean(post[-1000:]))
 over = np.where(np.abs(post - final) > 0.1 * abs(final))[0]
@@ -134,7 +134,7 @@ for snr_db in (10.0, 20.0, 30.0):
     noise_p = sig_p / (10 ** (snr_db / 10))
     noise = (rng.standard_normal(n16) + 1j * rng.standard_normal(n16)) * np.sqrt(noise_p / 2)
     x = sig + noise
-    out_pll, _, _ = _pll_block(x.astype(np.complex64), 0.0, 0.0, Kp, Ki, 16000.0 / (2 * np.pi))
+    out_pll, _, _, _ = _pll_block(x.astype(np.complex64), 0.0, 0.0, Kp, Ki, 16000.0 / (2 * np.pi), 0)
     xp = np.roll(x, 1)
     a_disc = np.imag(x * np.conj(xp)) / (np.abs(x) * np.abs(xp) + 1e-12) * 16000.0 / (2 * np.pi)
     r_pll = snd_nd(out_pll[16000:], 16000, 1000.0)

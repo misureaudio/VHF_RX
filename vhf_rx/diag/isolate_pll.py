@@ -28,7 +28,7 @@ def measure(f0):
     # input: carrier at 0 Hz (baseband), deviation DEV*sin(2 pi f0 t)
     phase = 2 * np.pi * np.cumsum(DEV * np.sin(2 * np.pi * f0 * t)) / FS
     x = np.exp(1j * phase).astype(np.complex64)
-    out, _, _ = _pll_block(x, 0.0, 0.0, Kp, Ki, scale)
+    out, _, _, _ = _pll_block(x, 0.0, 0.0, Kp, Ki, scale, 0)
     # skip 20 ms lock transient
     out = out[SKIP:]
     w = np.hanning(out.size)
@@ -48,7 +48,7 @@ for f0 in (300.0, 1000.0, 3000.0):
 t = np.arange(N) / FS
 phase = 2 * np.pi * np.cumsum(DEV * np.sin(2 * np.pi * 300 * t)) / FS
 x = np.exp(1j * phase).astype(np.complex64)
-out, _, _ = _pll_block(x, 0.0, 0.0, Kp, Ki, scale)
+out, _, _, _ = _pll_block(x, 0.0, 0.0, Kp, Ki, scale, 0)
 out = out[SKIP:]
 print(f"\n300 Hz case: output DC (mean) = {np.mean(out):.3f} Hz, "
       f"rms = {np.sqrt(np.mean(out**2)):.3f} Hz")
