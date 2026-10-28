@@ -1,0 +1,23 @@
+{
+  "band": "2m",
+  "rf_hz": 145000000.0,
+  "fs_hz": 6048000.0,
+  "radio": "rsp2pro",
+  "radio_label": "RSP2/RSP2pro (hwVer 2)",
+  "serial": "1710060810",
+  "hwver": 2,
+  "sample_scale": 32768.0,
+  "lna": 8,
+  "gr_db": 50,
+  "agc": "50Hz",
+  "agc_setpoint_dbfs": -20,
+  "total_gain_db": 33.66807556152344,
+  "duration_s": 10.000033099961001,
+  "blocks": 44667,
+  "samples": 60032448,
+  "measured_rate_mspS": 6.003224929348895,
+  "dropped_blocks": 0,
+  "overload_events": 0,
+  "noise_floor_db": -46.04681396484375,
+  "channels": {}
+}
